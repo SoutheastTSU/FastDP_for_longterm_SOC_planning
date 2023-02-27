@@ -39,7 +39,7 @@ end
 
 SOC = SOC_avail_range;
 
-[p_opt,fval] = DP(SOC,@SubObjectFun);
+[p_opt,fval] = DP(SOC,@SubObjectFun,delta_t);
 
 subplot(4,1,1);
 plot(p_opt(:,1));
@@ -48,7 +48,10 @@ xlabel('time/s');
 ylabel('SOC/%');
 
 subplot(4,1,2);
-plot(p_opt(:,2));
+action_max=45;
+action_min=0;
+action_resolution=5;
+plot((p_opt(:,2)-1)*action_resolution+action_min);
 title('增程器工作点变化');
 xlabel('time/s');
 ylabel('P_R_E/kW');
@@ -58,7 +61,7 @@ Q_HV = 46000;
 plot(p_opt(:,3)/Q_HV);
 title('累积燃油消耗');
 xlabel('time/s');
-ylabel('kg');
+ylabel('kJ');
 
 subplot(4,1,4);  
 plot(P_req/Q_HV);
@@ -68,7 +71,7 @@ ylabel('kW');
 
 
 %%  DP主函数
-function [p_opt,total_fuel] = DP(SOC,SubObjectFun)
+function [p_opt,total_fuel] = DP(SOC,SubObjectFun,delta_t)
 % 输入的SOC应当是SOC可行域
 % x为状态变量，一列代表一个阶段的状态
 % m函数DecisFun(k,s)表示，k阶段s状态下的可用决策集合（改进代码里面去除了这一步骤，不可用决策即使得SOC超出范围（或未来可能考虑的电池充放电电流）的决策，直接在DP过程中判断决策是否可用即可）
@@ -114,7 +117,8 @@ function [p_opt,total_fuel] = DP(SOC,SubObjectFun)
     
     load P_req P_req;
     
-    for step_idx = k-1:-1:1                      % 从后往前递推求出f_opt和d_opt
+    %% 从后往前递推求出最优损失和对应的最优动作
+    for step_idx = k-1:-1:1                      
         tmp_SOCnotNan = find(SOCNotNan(:, step_idx)); % 找出状态值不是NaN的下标集合
         tmp_num_SOC = length(tmp_SOCnotNan);
         for avail_soc_idx = 1:tmp_num_SOC
@@ -125,13 +129,22 @@ function [p_opt,total_fuel] = DP(SOC,SubObjectFun)
                  P_batt = max(P_batt, P_batt_min); %电池最大充放电功率
                  P_batt_idx = round((P_batt-P_batt_min)/P_batt_resolution+1);
                  
-                 % 令TransfrerValue查得的SOC与SOC_resolution一样的网格大小，使tmp_SOC_next肯定能直接定位到对应网格
-                 tmp_SOC_next = round(TransferValue(P_batt_idx, SOC_idx)/SOC_resolution)*SOC_resolution; % 根据state和action查状态转移
-                 if(tmp_SOC_next>SOC_max || tmp_SOC_next<SOC_min)
+                 % 原方案(已弃用)：令TransfrerValue查得的SOC与SOC_resolution一样的网格大小，使tmp_SOC_next肯定能直接定位到对应网格
+                 % tmp_SOC_next = round(TransferValue(P_batt_idx, SOC_idx)/SOC_resolution)*SOC_resolution; % 根据state和action查状态转移
+
+                 tmp_SOC_next = TransferValue(P_batt_idx, SOC_idx);
+                 if(tmp_SOC_next>=SOC_max || tmp_SOC_next<=SOC_min)
                      continue; % 跳过会导致SOC越界的决策
                  end
-                 SOC_next_idx = round((tmp_SOC_next - SOC_min)/SOC_resolution+1);
-                 tmp_loss = LossOfActions(action_idx) + OptLoss(SOC_next_idx, step_idx+1); % 单步loss和状态转移后的累积loss
+
+                 % 计算累积损失时需要插值，(tmp_SOC_next-a)/SOC_resolution)*(f(b)-f(a))+f(a),a为floor(tmp_SOC_next),b=a+SOC_resolution
+                 SOC_next_lower_idx = floor((tmp_SOC_next - SOC_min)/SOC_resolution)+1; % a
+                 SOC_next_upper_idx = SOC_next_lower_idx + 1; % b
+                 interp_Loss = (tmp_SOC_next/SOC_resolution - floor(tmp_SOC_next/SOC_resolution))  * ...
+                     (OptLoss(SOC_next_upper_idx, step_idx+1) - OptLoss(SOC_next_lower_idx, step_idx+1)) ...
+                     + OptLoss(SOC_next_lower_idx, step_idx+1);
+                 
+                 tmp_loss = LossOfActions(action_idx) + interp_Loss; % 单步loss和状态转移后的累积loss
                                    
                  if tmp_loss <= OptLoss(SOC_idx, step_idx)        % 找每个阶段使loss最小的action
                      OptAction(SOC_idx, step_idx) = action_idx;   % 保存每个子状态下最优的loss所对应的决策变量的下标
@@ -146,46 +159,48 @@ function [p_opt,total_fuel] = DP(SOC,SubObjectFun)
     toc
     time_consume = num2str(toc);
     
+    %% 前向计算一遍，得到最优控制序列
     total_fuel = OptLoss(SOCNotNan(:,1), 1);      % 从后往前迭代到初始时刻，就是累积油耗
-    tmp_state = nan*ones(k,1);                    % 用于存储各阶段的状态值(SOC)
-    tmp_action = nan*ones(k,1);                   % 用于存储各阶段的决策值
-    tmp_fuel = nan*ones(k,1);                     % 用于存储各阶段的指标函数值
+    state_series = nan*ones(k,1);                    % 用于存储各阶段的状态值(SOC)
+    action_series = nan*ones(k,1);                   % 用于存储各阶段的决策值
+    fuel_series = nan*ones(k,1);                     % 用于存储各阶段的指标函数值
     start_index = find(SOCNotNan(:,1));           % 找到初始状态点的下标
     
-    % load P_req P_req;
-    % for k = 1:1:3602
-    %     P_RE_vector = feval(DecisionFun,k);
-    %     num_actions = length(P_RE_vector);
-    %     for action_idx = 1: num_actions
-    %         P_batt(k,action_idx) = P_req(k) - P_RE_vector(action_idx);  % 不同时刻，电池的充放电功率
-    %     end
-    % end
-    
-    % state的长度肯定是k，action的长度肯定是k-1(不包含最后一刻),
     % fuel和action直接关联，但是k-1时刻的action产生的fuel是加在k时刻上的(初始时刻累积fuel为0)
     SOC_idx = start_index;
-    tmp_action(1) = OptAction(SOC_idx, 1);
-    tmp_fuel(1) = 0;
-    tmp_state(1) = SOC(SOC_idx, 1);
-    P_batt = min(P_req(1) - P_RE_vector(tmp_action(1)), P_batt_max);
-    P_batt = max(P_batt, P_batt_min); %电池最大充放电功率
-    P_batt_idx = round((P_batt-P_batt_min)/P_batt_resolution+1);
-    SOC_idx = round((TransferValue(P_batt_idx, SOC_idx) - SOC_min)/SOC_resolution+1);
+    action_series(1) = OptAction(SOC_idx, 1);
+    fuel_series(1) = 0;
+    state_series(1) = SOC(SOC_idx, 1);
+    P_batt = min(P_req(1) - P_RE_vector(action_series(1)), P_batt_max);
+    P_batt = max(P_batt, P_batt_min); %电池最大充放电功率限制
+    SOC_next = TransferFun(P_batt, SOC(start_index, 1), delta_t);
     
     for i=2:k-1
-        tmp_action(i) = OptAction(SOC_idx, i);       % 当前时刻的决策值下标
-        tmp_state(i) = SOC(SOC_idx, i);              % 当前时刻的状态值
-        tmp_fuel(i) = tmp_fuel(i-1) + LossOfActions(tmp_action(i-1));   % 当前时刻累积油耗为上时刻action产生的单步油耗+上时刻累积油耗
-        P_batt = min(P_req(i) - P_RE_vector(tmp_action(i)), P_batt_max);
+        state_series(i) = SOC_next; % 当前时刻的状态值,正向计算时不需要离散状态量了
+        
+        % 根据当前状态值，找最近两个状态值对应的最优action，插值
+        SOC_lower_idx = floor((SOC_next - SOC_min)/SOC_resolution);
+        tmp_action = OptAction(SOC_lower_idx, i) + (OptAction(SOC_lower_idx+1, i) - OptAction(SOC_lower_idx, i)) * ...
+            (SOC_next/SOC_resolution - floor(SOC_next/SOC_resolution));
+        % 因为增程器发电功率只能在网格上，所以得四舍五入一下
+        action_series(i) = round(tmp_action);
+
+        fuel_series(i) = fuel_series(i-1) + LossOfActions(action_series(i-1));   % 当前时刻累积油耗为上时刻action产生的单步油耗+上时刻累积油耗
+        
+        P_batt = min(P_req(i) - P_RE_vector(action_series(i)), P_batt_max);
         P_batt = max(P_batt, P_batt_min); %电池最大充放电功率
-        P_batt_idx = round((P_batt-P_batt_min)/P_batt_resolution+1);
-        tmp_SOC = max(SOC_min, TransferValue(P_batt_idx, SOC_idx));
-        tmp_SOC = min(tmp_SOC, SOC_max);
-        SOC_idx = round((tmp_SOC - SOC_min)/SOC_resolution+1);
+
+        tmp_SOC = TransferFun(P_batt, SOC_next, delta_t);
+
+        if(tmp_SOC<SOC_min || tmp_SOC>SOC_max) % 越界情况是不应该发生的
+            fprintf("SOC error in %dth cycle",i);
+        end
+
+        SOC_next = TransferFun(P_batt, SOC_next, delta_t);
     end
-    tmp_state(k) = SOC(SOC_idx, i);
-    tmp_fuel(k) = tmp_fuel(k-1) + LossOfActions(tmp_action(k-1));
+    state_series(k) = SOC_next;
+    fuel_series(k) = fuel_series(k-1) + LossOfActions(action_series(k-1));
     
-    p_opt = [tmp_state, tmp_action, tmp_fuel];
+    p_opt = [state_series, action_series, fuel_series];
     save p_opt.mat p_opt;
 end
